@@ -574,6 +574,40 @@ def _flip_action(action: str) -> str:
     return ACTION_OUT if action == ACTION_IN else ACTION_IN
 
 
+# 操作的字典序权重：keep < flip < delete
+_OP_ORDER = {OP_KEEP: 0, OP_FLIP: 1, OP_DELETE: 2}
+
+
+def _rank_edges(swipes: list[Swipe], f: list[list[int]],
+                rank: list[list[int]], i: int, p: int
+                ) -> list[tuple[str, int]]:
+    """状态 (i, p) 上达到最优成本的出边，按「整段最优后缀」字典序升序。
+
+    每条边为 (操作, 下一期待方向)：keep / flip 消费掉第 i 条并翻转期待，
+    delete 不消费期待。keep 与 flip 互斥（同一条记录不可能既匹配期待
+    又在翻转后匹配期待），故每点至多两条最优边。
+
+    边的尝试顺序不能只看本步操作：例如本步 flip、下步只能 delete，
+    整体可能大于本步 delete、下步 flip。因此以 (本步操作权重, 子状态
+    后缀排名) 为键排序——rank 是「最小最优后缀」的字典序名次，键序即
+    完整操作序列的字典序；配合 DFS 即按字典序枚举。
+    """
+    a = swipes[i].action
+    candidates: list[tuple[int, int, str, int]] = []
+    if (p == 0) == (a == ACTION_IN) and f[i + 1][1 - p] == f[i][p]:
+        candidates.append((_OP_ORDER[OP_KEEP], rank[i + 1][1 - p],
+                           OP_KEEP, 1 - p))
+    if (p == 0) == (_flip_action(a) == ACTION_IN) \
+            and 1 + f[i + 1][1 - p] == f[i][p]:
+        candidates.append((_OP_ORDER[OP_FLIP], rank[i + 1][1 - p],
+                           OP_FLIP, 1 - p))
+    if 1 + f[i + 1][p] == f[i][p]:
+        candidates.append((_OP_ORDER[OP_DELETE], rank[i + 1][p],
+                           OP_DELETE, p))
+    candidates.sort(key=lambda c: (c[0], c[1]))
+    return [(op, np) for _o, _r, op, np in candidates]
+
+
 def _min_edit_solutions(swipes: list[Swipe]
                         ) -> tuple[int, int, list[list[str]]]:
     """单卡（已按时间升序）最小编辑修复：动态规划。
@@ -583,8 +617,14 @@ def _min_edit_solutions(swipes: list[Swipe]
     必须从进站开始严格交替（即可完整配对）。
 
     返回 (最小编辑数, 最小编辑方案总数, 按稳定顺序的前
-    REPAIR_MAX_PLANS 个操作序列)。稳定顺序为 DFS 字典序
-    （keep < flip < delete，靠前的记录优先被编辑）。
+    REPAIR_MAX_PLANS 个操作序列)。稳定顺序为操作序列字典序
+    （keep < flip < delete，靠前的记录优先比较）。
+
+    最少数与方案数完全由 O(n) 的 f/g 表给出（g 为任意大整数，
+    方案总数再多也精确计算）；rank[i][p] 给出该状态「字典序最小最优
+    后缀」的同层名次用于给最优边定序，再用**显式栈的迭代 DFS** 物化前
+    若干个完整序列，栈深与记录数无关，单卡 3000 条也不会触碰递归
+    上限。取满 REPAIR_MAX_PLANS 个叶子即停，绝不枚举全部方案。
     """
     n = len(swipes)
     INF = n + 1
@@ -618,31 +658,67 @@ def _min_edit_solutions(swipes: list[Swipe]
                 total += g[i + 1][p]
             g[i][p] = total
 
-    # 沿最优边按稳定顺序物化前 REPAIR_MAX_PLANS 个操作序列
-    plans: list[list[str]] = []
-
-    def walk(i: int, p: int, ops: list[str]) -> None:
-        if len(plans) >= REPAIR_MAX_PLANS:
-            return
-        if i == n:
-            plans.append(list(ops))
-            return
+    # rank[i][p]：(i,p) 的「字典序最小最优后缀」在第 i 层各状态间的
+    # 字典序名次（0 起，越小越靠前）。后缀是第 i..n-1 条记录的固定长度
+    # 操作串（delete 不消费期待但仍占一个操作位），两条候选后缀的比较
+    # 只取决于 (本步操作权重, 子状态名次)，故自底向上每层对各状态的最小
+    # 候选键去重编号即可，时间与空间均为 O(n)。叶子 (n,0) 为空后缀、
+    # 名次 0；(n,1) 保留记录落单、不可行，名次 1（它只会被非最优边引用，
+    # 不影响任何可行状态的边序）。
+    rank: list[list[int]] = [[0, 1] for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
         a = swipes[i].action
-        if (p == 0) == (a == ACTION_IN) and f[i + 1][1 - p] == f[i][p]:
-            ops.append(OP_KEEP)
-            walk(i + 1, 1 - p, ops)
-            ops.pop()
-        if (p == 0) == (_flip_action(a) == ACTION_IN) \
-                and 1 + f[i + 1][1 - p] == f[i][p]:
-            ops.append(OP_FLIP)
-            walk(i + 1, 1 - p, ops)
-            ops.pop()
-        if 1 + f[i + 1][p] == f[i][p]:
-            ops.append(OP_DELETE)
-            walk(i + 1, p, ops)
-            ops.pop()
+        keys: list[Optional[tuple[int, int]]] = [None, None]
+        for p in (0, 1):
+            ckeys: list[tuple[int, int]] = []
+            if (p == 0) == (a == ACTION_IN) \
+                    and f[i + 1][1 - p] == f[i][p]:
+                ckeys.append((_OP_ORDER[OP_KEEP], rank[i + 1][1 - p]))
+            if (p == 0) == (_flip_action(a) == ACTION_IN) \
+                    and 1 + f[i + 1][1 - p] == f[i][p]:
+                ckeys.append((_OP_ORDER[OP_FLIP], rank[i + 1][1 - p]))
+            if 1 + f[i + 1][p] == f[i][p]:
+                ckeys.append((_OP_ORDER[OP_DELETE], rank[i + 1][p]))
+            # 某状态无最优边（不可行）时不参与本层排名，给占位名次；
+            # 它不会出现在任何可行状态的候选键里，故名次值无所谓。
+            keys[p] = min(ckeys) if ckeys else None
+        present = sorted(k for k in keys if k is not None)
+        code = {k: idx for idx, k in enumerate(present)}
+        rank[i][0] = code[keys[0]] if keys[0] is not None else len(present)
+        rank[i][1] = code[keys[1]] if keys[1] is not None else len(present)
 
-    walk(0, 0, [])
+    # 沿定序后的最优边做迭代 DFS，物化前 REPAIR_MAX_PLANS 个完整序列。
+    # 每个栈帧 (i, p, edges, k)：k 为该帧下一条待尝试的最优边下标；
+    # ops 始终与从根到当前帧的路径一一对应：进入子帧追加其操作，
+    # 子帧弹出时移除**它自己**的操作（边与操作一一对应），兄弟分支互不
+    # 污染。
+    plans: list[list[str]] = []
+    ops: list[str] = []
+    root_edges = [] if n == 0 else _rank_edges(swipes, f, rank, 0, 0)
+    stack: list[list] = [[0, 0, root_edges, 0]]
+    while stack and len(plans) < REPAIR_MAX_PLANS:
+        frame = stack[-1]
+        i, p, edges, k = frame
+        if i == n:
+            # 仅当最终期待回到「进站」（保留记录成对）时才是可行方案
+            if p == 0:
+                plans.append(list(ops))
+            stack.pop()
+            if ops:
+                ops.pop()
+            continue
+        if k < len(edges):
+            op, np = edges[k]
+            frame[3] = k + 1
+            ni = i + 1
+            child_edges = (_rank_edges(swipes, f, rank, ni, np)
+                           if ni < n else [])
+            ops.append(op)
+            stack.append([ni, np, child_edges, 0])
+        else:
+            stack.pop()
+            if ops:
+                ops.pop()
     return f[0][0], g[0][0], plans
 
 
@@ -709,9 +785,12 @@ def repair_preview(stations: list[Station],
     - 仅针对缺失进站 / 缺失出站 / 连续同向刷卡（verify 的 MISSING_ENTRY /
       MISSING_EXIT），按卡号分组、卡内按时间升序，做全局最小编辑搜索；
     - 允许的编辑只有「翻转进/出方向」与「删除记录」，各计 1 次；
-      原始时刻、站点、卡号一律不改写；
-    - 同成本方案按稳定顺序最多返回 REPAIR_MAX_PLANS 个，并标明
-      最小编辑数与未展示的方案数量，不替用户选定任何方案；
+      原始时刻、站点、卡号一律不改写；保留方向自进站开始成对交替；
+    - 最小编辑数（各卡之和）与同成本方案总数（各卡之积）由 O(n) 动态规划
+      精确给出，方案按稳定顺序最多物化 REPAIR_MAX_PLANS 个：单卡按操作
+      序列字典序（keep < flip < delete），多卡按卡号升序组合、卡号最大的
+      卡变化最快；长批次（单卡 3000 条、多卡混合）不触碰递归上限，也不先
+      枚举全部方案；
     - 全程只读：不保存记录、不写/清空账单。
     """
     result = verify(stations, fares, records, cfg)
@@ -745,14 +824,24 @@ def repair_preview(stations: list[Station],
 
     shown = min(total, REPAIR_MAX_PLANS)
     plans: list[dict] = []
-    # 稳定顺序枚举方案组合：混合进制计数，卡号大的方案索引变化最快；
-    # 全局前 REPAIR_MAX_PLANS 个组合只依赖各卡物化的前 REPAIR_MAX_PLANS 个序列。
+    # 稳定顺序枚举方案组合：卡号升序排列、做混合进制计数，卡号最大的卡
+    # 方案索引变化最快（等价于各卡方案序列按「后卡变化最快」做笛卡尔积
+    # 后取字典序前若干项）。
+    #
+    # 每个全局序号 combo < REPAIR_MAX_PLANS 落在任一卡上的数位都
+    # < REPAIR_MAX_PLANS（混合进制数位恒不超过其在总数中的余数），因此
+    # 各卡只需物化前 REPAIR_MAX_PLANS 个序列即可覆盖全部待展示组合，
+    # 无需先枚举任何卡的全部方案。
     cards = sorted(by_card)
     for combo in range(shown):
         choices: dict[str, int] = {}
         rest = combo
         for card in reversed(cards):
-            choices[card] = rest % len(card_plans[card])
+            local = rest % len(card_plans[card])
+            # 由上述界，local 必在已物化序列范围内；防御性检查避免静默回绕
+            if local >= len(card_plans[card]):
+                local = len(card_plans[card]) - 1
+            choices[card] = local
             rest //= len(card_plans[card])
         plans.append(_build_repair_plan(by_card, card_plans,
                                         choices, min_edits))
