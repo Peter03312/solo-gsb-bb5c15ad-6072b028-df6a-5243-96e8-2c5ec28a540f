@@ -583,8 +583,13 @@ def _min_edit_solutions(swipes: list[Swipe]
     必须从进站开始严格交替（即可完整配对）。
 
     返回 (最小编辑数, 最小编辑方案总数, 按稳定顺序的前
-    REPAIR_MAX_PLANS 个操作序列)。稳定顺序为 DFS 字典序
+    REPAIR_MAX_PLANS 个操作序列)。稳定顺序为操作序列字典序
     （keep < flip < delete，靠前的记录优先被编辑）。
+
+    方案展开为迭代式「第 k 个字典序方案」构造：借助方案计数表 g
+    逐位确定每条记录的操作，只物化实际返回的前几个方案——
+    既不递归（长批次不会触及递归深度上限），也不先枚举全部方案
+    再截断（方案数随记录数指数增长时耗时仍与记录数成线性）。
     """
     n = len(swipes)
     INF = n + 1
@@ -618,31 +623,37 @@ def _min_edit_solutions(swipes: list[Swipe]
                 total += g[i + 1][p]
             g[i][p] = total
 
-    # 沿最优边按稳定顺序物化前 REPAIR_MAX_PLANS 个操作序列
-    plans: list[list[str]] = []
-
-    def walk(i: int, p: int, ops: list[str]) -> None:
-        if len(plans) >= REPAIR_MAX_PLANS:
-            return
-        if i == n:
-            plans.append(list(ops))
-            return
-        a = swipes[i].action
-        if (p == 0) == (a == ACTION_IN) and f[i + 1][1 - p] == f[i][p]:
-            ops.append(OP_KEEP)
-            walk(i + 1, 1 - p, ops)
-            ops.pop()
-        if (p == 0) == (_flip_action(a) == ACTION_IN) \
-                and 1 + f[i + 1][1 - p] == f[i][p]:
-            ops.append(OP_FLIP)
-            walk(i + 1, 1 - p, ops)
-            ops.pop()
-        if 1 + f[i + 1][p] == f[i][p]:
+    # 第 k 个（0 起）字典序操作序列：在每个状态 (i, p) 按
+    # keep / flip / delete 的顺序尝试最优操作，该操作开头的方案数
+    # 为 g[后继状态]；k 落在其中则选定，否则扣除后继续尝试下一操作。
+    def kth_plan(k: int) -> list[str]:
+        ops: list[str] = []
+        i, p = 0, 0
+        while i < n:
+            a = swipes[i].action
+            if (p == 0) == (a == ACTION_IN) \
+                    and f[i + 1][1 - p] == f[i][p]:
+                cnt = g[i + 1][1 - p]
+                if k < cnt:
+                    ops.append(OP_KEEP)
+                    i, p = i + 1, 1 - p
+                    continue
+                k -= cnt
+            if (p == 0) == (_flip_action(a) == ACTION_IN) \
+                    and 1 + f[i + 1][1 - p] == f[i][p]:
+                cnt = g[i + 1][1 - p]
+                if k < cnt:
+                    ops.append(OP_FLIP)
+                    i, p = i + 1, 1 - p
+                    continue
+                k -= cnt
+            # delete 恒为最后候选；k < g[0][0] 时必然在此选定
             ops.append(OP_DELETE)
-            walk(i + 1, p, ops)
-            ops.pop()
+            i += 1
+        return ops
 
-    walk(0, 0, [])
+    shown = min(g[0][0], REPAIR_MAX_PLANS)
+    plans = [kth_plan(k) for k in range(shown)]
     return f[0][0], g[0][0], plans
 
 
